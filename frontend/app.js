@@ -2,7 +2,43 @@ const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
 let allTenders=[];
 function esc(v){return String(v??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
 function toast(msg,type=""){const e=$("#toast");e.textContent=msg;e.className="toast "+(type==="error"?"error":type==="info"?"info":"");window.scrollTo({top:0,behavior:"smooth"});setTimeout(()=>e.classList.add("hidden"),7000);}
-async function api(url,opts={}){const r=await fetch(url,opts);let d={};try{d=await r.json()}catch{}if(!r.ok)throw Error(d.detail||d.message||`HTTP ${r.status}`);return d;}
+const firebaseAppModule = await import("https://www.gstatic.com/firebasejs/11.0.2/firebase-app.js");
+const firebaseAuthModule = await import("https://www.gstatic.com/firebasejs/11.0.2/firebase-auth.js");
+const configResponse = await fetch("/api/config");
+const publicConfig = await configResponse.json();
+const firebaseConfig = publicConfig.firebase || {};
+let firebaseAuth = null;
+let firebaseReady = false;
+try {
+  if (!firebaseConfig.apiKey || !firebaseConfig.projectId || !firebaseConfig.appId || !firebaseConfig.authDomain) {
+    throw new Error("Firebase web config is incomplete. Fill FIREBASE_API_KEY, FIREBASE_AUTH_DOMAIN, FIREBASE_PROJECT_ID and FIREBASE_APP_ID in .env, then restart BidGuard.");
+  }
+  const firebaseApp = firebaseAppModule.initializeApp(firebaseConfig);
+  firebaseAuth = firebaseAuthModule.getAuth(firebaseApp);
+  firebaseReady = true;
+} catch (e) {
+  console.error(e);
+  setTimeout(() => authError(e.message || "Firebase initialization failed."), 0);
+}
+async function api(url,opts={}){
+  const headers = new Headers(opts.headers || {});
+  if (firebaseAuth?.currentUser) headers.set("Authorization", `Bearer ${await firebaseAuth.currentUser.getIdToken()}`);
+  const r=await fetch(url,{credentials:"same-origin",...opts,headers});let d={};try{d=await r.json()}catch{}if(!r.ok)throw Error(d.detail||d.message||`HTTP ${r.status}`);return d;
+}
+function friendlyAuthError(error){
+  const code=error?.code||"";
+  const messages={
+    "auth/invalid-credential":"Incorrect email or password.",
+    "auth/invalid-email":"Enter a valid email address.",
+    "auth/email-already-in-use":"An account with this email already exists.",
+    "auth/weak-password":"Choose a stronger password (at least 6 characters; BidGuard asks for 8).",
+    "auth/user-disabled":"This account has been disabled.",
+    "auth/too-many-requests":"Too many attempts. Wait a while and try again.",
+    "auth/network-request-failed":"Network error. Check your internet connection.",
+    "auth/operation-not-allowed":"Enable Email/Password sign-in in Firebase Console > Authentication > Sign-in method."
+  };
+  return messages[code] || error?.message || "Firebase authentication failed.";
+}
 function go(v){$$(".view").forEach(x=>x.classList.add("hidden"));$(`#view-${v}`).classList.remove("hidden");$$(".nav").forEach(x=>x.classList.toggle("active",x.dataset.view===v));$("#page-title").textContent=({dashboard:"Dashboard",tenders:"Discover tenders",company:"Company profile",detail:"Tender analysis"})[v]||"BidGuard";if(v==="dashboard"||v==="tenders")refresh();}
 function statusClass(s){return s==="Appears satisfied"?"good":s==="Potential mismatch"?"bad":["Missing evidence","Needs manual verification"].includes(s)?"warn":"";}
 function card(t){let fs=t.analysis?.findings||[],risks=fs.filter(f=>["Potential mismatch","Missing evidence","Needs manual verification"].includes(f.status)).length;return `<article class="tender"><div><h3 data-open="${t.id}">${esc(t.title)}</h3><div class="meta"><span>${esc(t.authority||"Authority not listed")}</span><span>${esc(t.location||"Location not listed")}</span><span>Deadline: ${esc(t.closing_date||"not verified")}</span></div><div class="meta"><span>Source: ${esc(t.source_name)}</span><span>Retrieved: ${esc((t.retrieved_at||"").slice(0,10))}</span></div></div><div class="right"><span class="pill ${t.status==="analyzed"?(risks?"warn":"good"):""}">${t.status==="analyzed"?(risks?risks+" item(s) to review":"Analyzed"):"Not analyzed"}</span><button class="mini" data-open="${t.id}">View analysis →</button></div></article>`;}
@@ -21,4 +57,38 @@ $$(".nav").forEach(b=>b.onclick=()=>go(b.dataset.view));$$("[data-goto]").forEac
 $("#manual-form").onsubmit=async e=>{e.preventDefault();try{let r=await api("/api/tenders/manual",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(obj(e.target))});toast(r.status==="duplicate"?"Tender already saved.":"Tender saved.");e.target.reset();$("#manual-form").classList.add("hidden");await refresh()}catch(err){toast(err.message,"error")}};
 $("#company-form").onsubmit=async e=>{e.preventDefault();try{await api("/api/company",{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify(obj(e.target))});toast("Company profile saved.");await loadCompany()}catch(err){toast(err.message,"error")}};
 document.addEventListener("click",e=>{let b=e.target.closest("[data-open]");if(b)openTender(Number(b.dataset.open))});
-(async()=>{try{await api("/api/health");await loadCompany();await refresh()}catch(e){toast("Backend connection failed: "+e.message,"error")}})();
+function formObject(form){let o={};for(const [k,v] of new FormData(form)){const el=form.elements.namedItem(k);o[k]=el&&el.type==="number"?(v===""?null:Number(v)):v;}return o;}
+function authError(msg){const e=$("#auth-error");e.textContent=msg;e.classList.remove("hidden");}
+function showAuth(mode){$("#login-form").classList.toggle("hidden",mode!=="login");$("#register-form").classList.toggle("hidden",mode!=="register");$("#show-login").classList.toggle("active",mode==="login");$("#show-register").classList.toggle("active",mode==="register");$("#auth-error").classList.add("hidden");}
+async function enterApp(user){$("#auth-screen").classList.add("hidden");$("#app-shell").classList.remove("hidden");$("#signed-in-as").textContent=user?.full_name||user?.email||"Workspace";await loadCompany();await refresh();go("dashboard");}
+$("#show-login").onclick=()=>showAuth("login");$("#show-register").onclick=()=>showAuth("register");
+$("#login-form").onsubmit=async e=>{
+  e.preventDefault();const b=e.target.querySelector("button");b.disabled=true;
+  try{
+    if(!firebaseReady)throw new Error("Firebase is not configured. Check the Firebase values in .env and restart the server.");
+    const values=formObject(e.target);
+    await firebaseAuthModule.signInWithEmailAndPassword(firebaseAuth,values.email,values.password);
+    const d=await api("/api/auth/me");e.target.reset();await enterApp(d.user);
+  }catch(err){authError(friendlyAuthError(err))}finally{b.disabled=false}
+};
+$("#register-form").onsubmit=async e=>{
+  e.preventDefault();const b=e.target.querySelector("button");b.disabled=true;
+  try{
+    if(!firebaseReady)throw new Error("Firebase is not configured. Check the Firebase values in .env and restart the server.");
+    const values=formObject(e.target);
+    const credential=await firebaseAuthModule.createUserWithEmailAndPassword(firebaseAuth,values.email,values.password);
+    await firebaseAuthModule.updateProfile(credential.user,{displayName:values.full_name});
+    const {email,password,...profile}=values;
+    const d=await api("/api/auth/bootstrap",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(profile)});
+    e.target.reset();await enterApp(d.user);toast("Firebase account created and company profile saved. Tender discovery is now personalized to your business.","info");
+  }catch(err){authError(friendlyAuthError(err))}finally{b.disabled=false}
+};
+$("#logout").onclick=async()=>{try{await api("/api/auth/logout",{method:"POST"})}catch{}try{if(firebaseAuth?.currentUser)await firebaseAuthModule.signOut(firebaseAuth)}catch{}$("#app-shell").classList.add("hidden");$("#auth-screen").classList.remove("hidden");showAuth("login");};
+if(firebaseReady){
+  firebaseAuthModule.onAuthStateChanged(firebaseAuth,async user=>{
+    if(!user){$("#auth-screen").classList.remove("hidden");$("#app-shell").classList.add("hidden");return;}
+    try{const d=await api("/api/auth/me");await enterApp(d.user)}catch(err){authError(err.message);$("#auth-screen").classList.remove("hidden");$("#app-shell").classList.add("hidden");}
+  });
+} else {
+  $("#auth-screen").classList.remove("hidden");$("#app-shell").classList.add("hidden");
+}
