@@ -1,24 +1,24 @@
-import hashlib, json, os, secrets, hmac, time
-from datetime import datetime, timezone
+import hashlib, json, os, secrets, hmac, time, threading, uuid
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
 from dotenv import load_dotenv
+load_dotenv()
 from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, EmailStr
 from pypdf import PdfReader
 from .db import db, init_db
-from .logic import extract_requirements, compare
+from .logic import extract_requirements, compare, rank_tender
 from .tinyfish import discover
 from google.auth.transport import requests as google_requests
 from google.oauth2 import id_token as google_id_token
 
-load_dotenv()
 BASE = Path(__file__).resolve().parent.parent
 FRONT = BASE / "frontend"
 UPLOADS = Path(os.getenv("BIDGUARD_UPLOAD_DIR", "uploads")); UPLOADS.mkdir(parents=True, exist_ok=True)
-app = FastAPI(title="BidGuard", version="0.2.0")
+app = FastAPI(title="BidGuard", version="0.3.0")
 app.mount("/static", StaticFiles(directory=str(FRONT)), name="static")
 def now(): return datetime.now(timezone.utc).isoformat()
 def firebase_project_id():
@@ -78,7 +78,7 @@ def startup(): init_db()
 @app.get("/")
 def index(): return FileResponse(FRONT/"index.html")
 @app.get("/api/health")
-def health(): return {"status":"ok","app":"BidGuard","version":"0.2.0","time":now()}
+def health(): return {"status":"ok","app":"BidGuard","version":"0.3.0","time":now()}
 
 class FirebaseBootstrap(BaseModel):
     full_name: str = Field(min_length=2, max_length=100)
@@ -150,15 +150,34 @@ class ManualTender(BaseModel):
     title:str=Field(min_length=3,max_length=500); source_url:str=Field(min_length=8,max_length=2000)
     tender_reference:str=""; authority:str=""; location:str=""; closing_date:str=""; estimated_value:str=""; raw_text:str=""
 @app.get("/api/tenders")
-def list_tenders(q:str="",status:str="",user=Depends(current_user)):
-    with db() as c:rows=c.execute("SELECT * FROM tenders WHERE user_id=? ORDER BY retrieved_at DESC",(user["id"],)).fetchall()
-    out=[]
+def list_tenders(q: str = "", status: str = "", limit: int = 500, offset: int = 0, user=Depends(current_user)):
+    # Search in SQLite rather than loading every user's tender into Python.
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    clauses = ["user_id=?"]
+    params = [user["id"]]
+    if q.strip():
+        like = f"%{q.strip()}%"
+        clauses.append("(title LIKE ? OR authority LIKE ? OR location LIKE ? OR tender_reference LIKE ?)")
+        params.extend([like, like, like, like])
+    if status and status != "all":
+        clauses.append("status=?")
+        params.append(status)
+    where = " AND ".join(clauses)
+    with db() as c:
+        count = c.execute(f"SELECT COUNT(*) FROM tenders WHERE {where}", params).fetchone()[0]
+        rows = c.execute(f"SELECT * FROM tenders WHERE {where} ORDER BY retrieved_at DESC LIMIT ? OFFSET ?", [*params, limit, offset]).fetchall()
+        profile_row = c.execute("SELECT data FROM company_profiles WHERE user_id=?", (user["id"],)).fetchone()
+    company = json.loads(profile_row["data"]) if profile_row else {}
+    out = []
     for row in rows:
-        d=dict(row)
-        if q and q.lower() not in (d["title"]+" "+d["authority"]+" "+d["location"]).lower():continue
-        if status and status!="all" and d["status"]!=status:continue
-        d["analysis"]=json.loads(d.pop("analysis_json") or "{}");out.append(d)
-    return {"tenders":out,"count":len(out)}
+        d = dict(row)
+        d["analysis"] = json.loads(d.pop("analysis_json") or "{}")
+        d.update(rank_tender(d, company))
+        out.append(d)
+    out.sort(key=lambda item: (item["match_score"], item.get("retrieved_at", "")), reverse=True)
+    return {"tenders": out, "count": count, "limit": limit, "offset": offset}
+
 def owned_tender(tid,uid):
     with db() as c:row=c.execute("SELECT * FROM tenders WHERE id=? AND user_id=?",(tid,uid)).fetchone()
     if not row:raise HTTPException(404,"Tender not found in your account.")
@@ -168,14 +187,77 @@ def tender_detail(tid:int,user=Depends(current_user)):
     row=owned_tender(tid,user["id"])
     with db() as c:docs=c.execute("SELECT id,filename,page_count,uploaded_at FROM documents WHERE tender_id=? ORDER BY id DESC",(tid,)).fetchall()
     d=dict(row);d["analysis"]=json.loads(d.pop("analysis_json") or "{}");d["documents"]=[dict(x) for x in docs];return d
+# Discovery runs in a background thread. The API returns immediately so a slow
+# browser-agent session cannot hold the user's HTTP request open.
+_discovery_lock = threading.Lock()
+_active_discovery_users = set()
+
+
+def _run_discovery_job(job_id: str, uid: int, profile: dict):
+    try:
+        result = discover(profile)
+        imported = duplicates = 0
+        for tender in result.get("tenders", []):
+            _, created = save_tender(tender, "TinyFish / CPPP", uid)
+            imported += int(created)
+            duplicates += int(not created)
+        status = result.get("status", "error")
+        message = str(result.get("message", "Discovery finished."))[:2000]
+        with db() as c:
+            c.execute("UPDATE discovery_jobs SET status='completed', finished_at=?, message=?, imported=?, duplicates=?, result_status=? WHERE job_id=? AND user_id=?",
+                      (now(), message, imported, duplicates, status, job_id, uid))
+    except Exception as exc:
+        with db() as c:
+            c.execute("UPDATE discovery_jobs SET status='failed', finished_at=?, message=?, result_status='error' WHERE job_id=? AND user_id=?",
+                      (now(), f"Discovery failed ({type(exc).__name__}): {str(exc)[:500]}", job_id, uid))
+    finally:
+        with _discovery_lock:
+            _active_discovery_users.discard(uid)
+
+
 @app.post("/api/discovery/run")
-def run_discovery(user=Depends(current_user)):
-    with db() as c:row=c.execute("SELECT data FROM company_profiles WHERE user_id=?",(user["id"],)).fetchone()
-    profile=json.loads(row["data"]) if row else {}
-    result=discover(profile);imported=duplicates=0
-    for t in result.get("tenders",[]):
-        _,created=save_tender(t,"TinyFish / CPPP",user["id"]);imported+=int(created);duplicates+=int(not created)
-    return {"status":result.get("status","error"),"message":result.get("message",""),"imported":imported,"duplicates":duplicates}
+def run_discovery(force: bool = False, user=Depends(current_user)):
+    uid = user["id"]
+    with _discovery_lock:
+        if uid in _active_discovery_users:
+            with db() as c:
+                row = c.execute("SELECT job_id,status,started_at FROM discovery_jobs WHERE user_id=? AND status='running' ORDER BY started_at DESC LIMIT 1", (uid,)).fetchone()
+            if row:
+                return {"status": "running", "job_id": row["job_id"], "message": "A discovery run is already in progress."}
+        # Reuse a recent successful/partial run by default to avoid repeated, costly browser sessions.
+        if not force:
+            with db() as c:
+                recent = c.execute("SELECT * FROM discovery_jobs WHERE user_id=? AND status='completed' AND result_status IN ('success','partial') AND started_at >= ? ORDER BY started_at DESC LIMIT 1",
+                                   (uid, (datetime.now(timezone.utc) - timedelta(minutes=15)).isoformat())) .fetchone()
+            if recent:
+                return {"status": "cached", "job_id": recent["job_id"], "message": "Showing the latest discovery result. Use Force refresh to search the portal again.", "imported": recent["imported"], "duplicates": recent["duplicates"], "finished_at": recent["finished_at"]}
+        with db() as c:
+            profile_row = c.execute("SELECT data FROM company_profiles WHERE user_id=?", (uid,)).fetchone()
+        profile = json.loads(profile_row["data"]) if profile_row else {}
+        job_id = uuid.uuid4().hex
+        with db() as c:
+            c.execute("INSERT INTO discovery_jobs(job_id,user_id,status,started_at,message) VALUES(?,?,?,?,?)",
+                      (job_id, uid, "running", now(), "Connecting to the tender source…"))
+        _active_discovery_users.add(uid)
+        threading.Thread(target=_run_discovery_job, args=(job_id, uid, profile), daemon=True, name=f"bidguard-discovery-{job_id[:8]}").start()
+    return {"status": "running", "job_id": job_id, "message": "Discovery started in the background. You can continue using BidGuard while it runs."}
+
+
+@app.get("/api/discovery/jobs/{job_id}")
+def discovery_job_status(job_id: str, user=Depends(current_user)):
+    with db() as c:
+        row = c.execute("SELECT job_id,status,started_at,finished_at,message,imported,duplicates,result_status FROM discovery_jobs WHERE job_id=? AND user_id=?", (job_id, user["id"])).fetchone()
+    if not row:
+        raise HTTPException(404, "Discovery job not found.")
+    return dict(row)
+
+
+@app.get("/api/discovery/latest")
+def latest_discovery(user=Depends(current_user)):
+    with db() as c:
+        row = c.execute("SELECT job_id,status,started_at,finished_at,message,imported,duplicates,result_status FROM discovery_jobs WHERE user_id=? ORDER BY started_at DESC LIMIT 1", (user["id"],)).fetchone()
+    return {"job": dict(row) if row else None}
+
 @app.post("/api/tenders/manual")
 def add_manual(t:ManualTender,user=Depends(current_user)):
     d=t.model_dump()
@@ -196,8 +278,8 @@ async def upload_pdf(tid:int,file:UploadFile=File(...),user=Depends(current_user
         reader=PdfReader(str(path));parts=[]
         for i,page in enumerate(reader.pages):
             txt=page.extract_text() or ""
-            if txt.strip():parts.append(f"[Page {i+1}]\\n{txt}")
-        extracted="\\n\\n".join(parts);pages=len(reader.pages)
+            if txt.strip():parts.append(f"[Page {i+1}]\n{txt}")
+        extracted="\n\n".join(parts);pages=len(reader.pages)
     except Exception as e:
         path.unlink(missing_ok=True);raise HTTPException(400,f"Could not read PDF: {str(e)[:250]}")
     with db() as c:

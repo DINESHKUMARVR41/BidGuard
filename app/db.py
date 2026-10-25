@@ -20,6 +20,14 @@ def init_db():
           raw_text TEXT NOT NULL DEFAULT '',analysis_json TEXT NOT NULL DEFAULT '{}',UNIQUE(user_id,tender_key),
           FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE);
         CREATE TABLE IF NOT EXISTS documents(id INTEGER PRIMARY KEY AUTOINCREMENT,tender_id INTEGER NOT NULL,filename TEXT NOT NULL,stored_path TEXT NOT NULL,page_count INTEGER,uploaded_at TEXT NOT NULL,FOREIGN KEY(tender_id) REFERENCES tenders(id) ON DELETE CASCADE);
+        CREATE TABLE IF NOT EXISTS discovery_jobs(
+          job_id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, status TEXT NOT NULL,
+          started_at TEXT NOT NULL, finished_at TEXT, message TEXT NOT NULL DEFAULT '',
+          imported INTEGER NOT NULL DEFAULT 0, duplicates INTEGER NOT NULL DEFAULT 0,
+          result_status TEXT NOT NULL DEFAULT '', FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_tenders_user_retrieved ON tenders(user_id, retrieved_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_discovery_jobs_user_started ON discovery_jobs(user_id, started_at DESC);
         """)
         # Upgrade existing local databases without deleting existing company/tender data.
         columns = {row["name"] for row in c.execute("PRAGMA table_info(users)").fetchall()}
