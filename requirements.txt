@@ -7,3 +7,4 @@ python-dotenv>=1.0
 tinyfish
 email-validator>=2.2
 google-auth>=2.35
+requests>=2.32

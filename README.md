@@ -1,28 +1,27 @@
-# BidGuard — Tender Discovery & Pre-Bid Risk Review
+# BidGuard — Firebase authentication + personalized tender discovery
 
-BidGuard helps a business discover relevant public tender listings, rank them against a company profile, extract text from tender PDFs, and flag eligibility clauses for human review.
+## Included
+- Firebase Email/Password authentication for registration and sign-in.
+- Firebase ID token verification on the FastAPI backend before account-specific endpoints are served.
+- Company registration and profile storage in SQLite, scoped to the signed-in Firebase user.
+- Profile-based tender discovery goal using company industry, products/services, locations, categories, keywords, exclusions and preferred value range.
+- Tender PDF text extraction and preliminary eligibility review.
 
-## What's improved in this version
+## 1. Configure Firebase (required)
 
-- **Background discovery:** starting a TinyFish run returns immediately. It runs in a background thread, so the browser page and other API calls remain responsive while the portal is being inspected.
-- **15-minute discovery cache:** repeated clicks reuse a recent successful/partial discovery instead of paying for another slow browser session. Use **Force refresh** when you actually need a new portal search.
-- **Discovery progress:** the UI polls the job status and refreshes the tender list when the run completes.
-- **Fast local search:** tender search and status filtering happen in SQLite, with a bounded result page.
-- **Company-profile match score:** saved tenders receive a transparent heuristic relevance score with short reasons based on keywords, categories, regions and exclusions. This is a relevance estimate, not an eligibility result.
-- **PDF extraction:** text-based PDFs are stored and extracted locally. Page separators are preserved in the extracted text.
-- **Deduplication:** repeated tender references/URLs are not imported again for the same account.
-- **Safe fallback:** manual tender entry remains available if a portal blocks automation or returns no usable results.
+An API key by itself is not the complete Firebase Web App configuration. In the [Firebase Console](https://console.firebase.google.com/):
 
-## Requirements
+1. Open or create your Firebase project.
+2. Go to **Authentication → Sign-in method** and enable **Email/Password**.
+3. Go to **Project settings → General → Your apps**. Register a Web app if you do not already have one.
+4. Copy these four values from the Web App configuration: `apiKey`, `authDomain`, `projectId`, and `appId`.
+5. Copy `.env.example` to `.env`. The example contains placeholders; replace them with values from your own Firebase Web App configuration before running. Keep `FIREBASE_PROJECT_ID` exactly the same as the Firebase project ID.
 
-- Windows 10/11
-- Python 3.11 recommended
-- A Firebase Web App with Email/Password authentication enabled
-- A TinyFish API key for automatic browser-based discovery
+The Firebase Web API key is a client configuration value, not a private server credential. You should still restrict it appropriately in Google Cloud. Never put a Firebase service-account private key in the frontend or commit `.env` to GitHub.
 
-## Setup on Windows PowerShell
+## 2. Run on Windows PowerShell
 
-From the extracted `BidGuard-main` directory:
+Extract the ZIP, open PowerShell in the extracted `BidGuard-main` folder, then run:
 
 ```powershell
 py -3.11 -m venv .venv
@@ -30,52 +29,26 @@ py -3.11 -m venv .venv
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 Copy-Item .env.example .env
-```
-
-Open `.env` and verify the Firebase web configuration values. Set `TINYFISH_API_KEY` if you want automatic discovery. Then start the app:
-
-```powershell
+# Edit .env now and fill the Firebase values (and TINYFISH_API_KEY if available)
 uvicorn app.main:app --reload
 ```
 
-Open <http://127.0.0.1:8000>.
+Open http://127.0.0.1:8000. Create a Firebase account, enter your company details, then run tender discovery.
 
-### Firebase setup
+If PowerShell says `.env` already exists, do not overwrite your existing configuration; edit it manually instead. Ensure the four `FIREBASE_*` values match the same Firebase project, then restart the server after changing `.env`.
 
-In Firebase Console, enable **Authentication → Sign-in method → Email/Password**. The values `FIREBASE_API_KEY`, `FIREBASE_AUTH_DOMAIN`, `FIREBASE_PROJECT_ID`, and `FIREBASE_APP_ID` must belong to the same Firebase Web App. The API key is client configuration, not a service-account secret; do not add service-account private keys to the frontend or commit `.env`.
+## 3. TinyFish
 
-## Faster discovery workflow
+Add `TINYFISH_API_KEY=your_key` to `.env`, restart the server and use Discover tenders. The integration depends on current TinyFish SDK compatibility, account access, and whether the portal permits public automated navigation. No tenders are fabricated when retrieval fails.
 
-1. Set up a company profile once.
-2. Click **Discover tenders**. The API responds quickly and the search runs in the background.
-3. Continue using the app while discovery runs. The tender list updates after completion.
-4. Click **Force refresh** only when you want to start a new external browser session immediately.
-5. Browse and rank saved records locally without re-running TinyFish.
-6. Upload PDFs and run the preliminary eligibility review only on shortlisted tenders.
+## Database notes
 
-The 15-minute cache applies to completed runs with a `success` or `partial` result. A run that is still active is reused instead of starting a duplicate session. Background jobs are stored in SQLite; the worker itself is an in-process thread, so keep the FastAPI process running until the job finishes. For multi-worker/production deployments, move background work to a durable queue such as Celery/RQ and a shared database.
+Company profiles and tenders are stored locally in SQLite. The app can add the Firebase UID column to a compatible existing users table. If an old database has an incompatible table schema, startup now reports the table and missing columns clearly rather than failing later with a confusing SQL error. If upgrading from an older BidGuard version, back up your database first. If you do not need the old data, rename the old `bidguard.db` before starting this version so the new schema is created cleanly.
 
-## API endpoints
+## Security and limitations
 
-- `GET /api/health` — app health check
-- `GET /api/tenders?q=...&status=...&limit=...&offset=...` — search saved tenders
-- `POST /api/discovery/run` — start/reuse a discovery run
-- `POST /api/discovery/run?force=true` — bypass the recent-result cache
-- `GET /api/discovery/jobs/{job_id}` — poll a discovery job
-- `GET /api/discovery/latest` — latest discovery job for the signed-in user
-- `POST /api/tenders/manual` — add a verified tender manually
-- `POST /api/tenders/{id}/documents` — upload a text-based PDF
-- `POST /api/tenders/{id}/analyze` — run the local preliminary clause review
-
-Account-specific endpoints require a valid Firebase ID token.
-
-## Important limitations
-
-- TinyFish still has to navigate the source website; the external search itself may take tens of seconds or minutes. Background execution improves app responsiveness but does **not** make the external portal instantly searchable.
-- The portal may change its UI, restrict automation, show CAPTCHA, or provide incomplete visible results. BidGuard does not bypass access controls.
-- Discovery currently uses TinyFish for portal navigation. It does not claim a direct official tender API exists.
-- The company match score is keyword/rule-based and can produce false positives or misses.
-- Eligibility review is currently local, heuristic and preliminary. It is not a legal opinion or an official eligibility determination. Verify the latest tender notice, all corrigenda, financial periods, exemptions, supporting documents and every important clause manually.
-- Scanned PDFs need OCR, which is not included. If text extraction returns no text, review the original document manually.
-- Firebase is required for sign-in. TinyFish is required for automatic discovery. Manual tender entry and local review can still be used after authentication when discovery is unavailable.
-- This is a local hackathon MVP. Before public deployment, add rate limiting, robust job queueing, monitoring, retention controls, backups, HTTPS and production security review.
+- Firebase handles password storage and sign-in; BidGuard verifies Firebase ID tokens server-side.
+- Email/password sign-in must be enabled in Firebase Console (Authentication → Sign-in method → Email/Password). If Firebase returns `auth/configuration-not-found`, first finish setting up Firebase Authentication and enable this provider; check that the app uses the same project ID and Web API key. Email verification and password-reset UI are not implemented in BidGuard yet.
+- This is a local MVP, not a production deployment. Use HTTPS, review Firebase API key restrictions, add rate limiting and operational monitoring before public deployment.
+- PDF extraction supports text-based PDFs, not OCR for scanned documents.
+- Tender analysis is heuristic and preliminary, not legal advice or an official eligibility determination.
